@@ -550,6 +550,9 @@ fn struct_union(
                             member_scope.scopes = copy_scopes(&x.scopes);
                             member_scope.ident = var.ident;
                             member_scope.byte_idx = var.byte_idx;
+                            member_scope.type_str = var.type_str;
+                            member_scope.completion_kind = var.completion_kind;
+                            member_scope.symbol_kind = var.symbol_kind;
                             scope.scopes.push(Box::new(member_scope));
                         }
                     }

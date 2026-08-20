@@ -83,6 +83,10 @@ pub trait Definition: std::fmt::Debug + Sync + Send {
     fn starts_with(&self, token: &str) -> bool;
     // constructs the completion for this definition
     fn completion(&self) -> CompletionItem;
+    // whether this definition imports the given identifier from its package
+    fn imports_identifier(&self, _: &str) -> bool {
+        false
+    }
     fn dot_completion(&self, scope_tree: &GenericScope) -> Vec<CompletionItem>;
 }
 
@@ -169,13 +173,13 @@ pub trait Scope: std::fmt::Debug + Definition + Sync + Send {
         // we invoke dot completion on that definition and pass it the syntax tree
         for def in self.defs() {
             trace!("def: {:?}", def);
-            if def.starts_with(token) {
+            if def.ident() == token {
                 trace!("complete def: {:?}", def);
                 return def.dot_completion(scope_tree);
             }
         }
         for scope in self.scopes() {
-            if scope.starts_with(token) {
+            if scope.ident() == token {
                 trace!("found dot-completion scope: {}", scope.ident());
                 return scope.dot_completion(scope_tree);
             }
@@ -363,17 +367,15 @@ impl Definition for PortDec {
         }
     }
     fn dot_completion(&self, scope_tree: &GenericScope) -> Vec<CompletionItem> {
-        for scope in &scope_tree.scopes {
-            if let Some(interface) = &self.interface {
+        if let Some(interface) = &self.interface {
+            for scope in &scope_tree.scopes {
                 if &scope.ident() == interface {
-                    return match &self.modport {
+                    let completions = match &self.modport {
                         Some(modport) => {
-                            for def in scope.defs() {
-                                if def.starts_with(modport) {
-                                    return def.dot_completion(scope_tree);
-                                }
+                            match scope.defs().iter().find(|def| def.starts_with(modport)) {
+                                Some(def) => def.dot_completion(scope_tree),
+                                None => Vec::new(),
                             }
-                            Vec::new()
                         }
                         None => scope
                             .defs()
@@ -382,10 +384,13 @@ impl Definition for PortDec {
                             .map(|x| x.completion())
                             .collect(),
                     };
+                    if !completions.is_empty() {
+                        return completions;
+                    }
                 }
             }
         }
-        Vec::new()
+        scope_tree.resolve_struct_members(&self.type_str, &self.ident, self.byte_idx, &self.url)
     }
 }
 
@@ -448,8 +453,8 @@ impl Definition for GenericDec {
             ..CompletionItem::default()
         }
     }
-    fn dot_completion(&self, _: &GenericScope) -> Vec<CompletionItem> {
-        Vec::new()
+    fn dot_completion(&self, scope_tree: &GenericScope) -> Vec<CompletionItem> {
+        scope_tree.resolve_struct_members(&self.type_str, &self.ident, self.byte_idx, &self.url)
     }
 }
 
@@ -506,6 +511,9 @@ impl Definition for PackageImport {
     }
     fn starts_with(&self, token: &str) -> bool {
         self.ident.starts_with(token)
+    }
+    fn imports_identifier(&self, ident: &str) -> bool {
+        self.asterisk || self.import_ident.as_deref() == Some(ident)
     }
     fn completion(&self) -> CompletionItem {
         CompletionItem {
@@ -763,6 +771,146 @@ pub struct GenericScope {
     pub scopes: Vec<Box<dyn Scope>>,
 }
 
+fn type_tokens(type_str: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = type_str.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == ':' && chars.peek() == Some(&':') {
+            chars.next();
+            tokens.push("::".to_string());
+        } else if matches!(c, '[' | ']' | '=' | ';' | ',') {
+            tokens.push(c.to_string());
+        } else if c == '\\' {
+            let mut ident = String::from(c);
+            while let Some(next) = chars.peek() {
+                if next.is_whitespace() {
+                    break;
+                }
+                ident.push(*next);
+                chars.next();
+            }
+            tokens.push(ident);
+        } else if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+            let mut ident = String::from(c);
+            while let Some(next) = chars.peek() {
+                if !(next.is_ascii_alphanumeric() || *next == '_' || *next == '$') {
+                    break;
+                }
+                ident.push(*next);
+                chars.next();
+            }
+            tokens.push(ident);
+        }
+    }
+    tokens
+}
+
+fn qualified_type_paths(tokens: &[String]) -> Vec<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut i = 0;
+    while i + 2 < tokens.len() {
+        if tokens[i] != "::" && tokens[i + 1] == "::" && tokens[i + 2] != "::" {
+            let mut path = vec![tokens[i].clone(), tokens[i + 2].clone()];
+            let mut next = i + 3;
+            while next + 1 < tokens.len() && tokens[next] == "::" && tokens[next + 1] != "::" {
+                path.push(tokens[next + 1].clone());
+                next += 2;
+            }
+            paths.push(path);
+            i = next;
+        } else {
+            i += 1;
+        }
+    }
+    paths
+}
+
+fn named_type_path(type_str: &str, array_declarator: &str) -> Option<Vec<String>> {
+    let tokens = type_tokens(type_str);
+    let mut end = tokens.len();
+    if let Some(pos) = tokens[..end].iter().position(|token| token == "=") {
+        end = pos;
+    }
+    if let Some(pos) = tokens[..end].iter().position(|token| token == "[") {
+        end = pos;
+        if end > 0 && tokens[end - 1] == array_declarator {
+            end -= 1;
+        }
+    }
+
+    let type_tokens = &tokens[..end];
+    if let Some(path) = qualified_type_paths(type_tokens).pop() {
+        return Some(path);
+    }
+    type_tokens
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.as_str(), "::" | "]" | ";" | ","))
+        .map(|ident| vec![ident.clone()])
+}
+
+fn is_struct_typedef_scope(scope: &dyn Scope) -> bool {
+    scope.completion_kind() == CompletionItemKind::STRUCT
+        && type_tokens(&scope.type_str())
+            .iter()
+            .any(|token| token == "typedef")
+}
+
+fn push_unique_scope<'a>(matches: &mut Vec<&'a dyn Scope>, candidate: &'a dyn Scope) {
+    if !matches.iter().any(|scope| {
+        scope.ident() == candidate.ident()
+            && scope.byte_idx() == candidate.byte_idx()
+            && scope.url() == candidate.url()
+    }) {
+        matches.push(candidate);
+    }
+}
+
+fn find_scopes_by_path<'a>(
+    scopes: &'a [Box<dyn Scope>],
+    path: &[String],
+    matches: &mut Vec<&'a dyn Scope>,
+) {
+    if path.is_empty() {
+        return;
+    }
+    for scope in scopes {
+        if scope.ident() == path[0] {
+            if path.len() == 1 {
+                if is_struct_typedef_scope(scope.as_ref()) {
+                    push_unique_scope(matches, scope.as_ref());
+                }
+            } else {
+                find_scopes_by_path(scope.scopes(), &path[1..], matches);
+            }
+        }
+    }
+}
+
+fn append_containing_scopes<'a>(
+    scopes: &'a [Box<dyn Scope>],
+    byte_idx: usize,
+    url: &Url,
+    path: &mut Vec<&'a dyn Scope>,
+) {
+    for scope in scopes {
+        if &scope.url() == url && scope.start() <= byte_idx && byte_idx <= scope.end() {
+            path.push(scope.as_ref());
+            append_containing_scopes(scope.scopes(), byte_idx, url, path);
+            break;
+        }
+    }
+}
+
+fn scope_member_completions(scope: &dyn Scope) -> Vec<CompletionItem> {
+    scope
+        .defs()
+        .iter()
+        .map(|def| def.completion())
+        .chain(scope.scopes().iter().map(|member| member.completion()))
+        .collect()
+}
+
 impl GenericScope {
     pub fn new(url: &Url) -> Self {
         Self {
@@ -778,6 +926,84 @@ impl GenericScope {
             defs: Vec::new(),
             scopes: Vec::new(),
         }
+    }
+
+    fn resolve_struct_members(
+        &self,
+        type_str: &str,
+        array_declarator: &str,
+        byte_idx: usize,
+        url: &Url,
+    ) -> Vec<CompletionItem> {
+        let type_path = match named_type_path(type_str, array_declarator) {
+            Some(path) => path,
+            None => return Vec::new(),
+        };
+        let type_ident = type_path.last().unwrap();
+
+        if type_path.len() > 1 {
+            let mut matches = Vec::new();
+            for package in self.scopes.iter().filter(|scope| {
+                scope.symbol_kind() == SymbolKind::PACKAGE && scope.ident() == type_path[0]
+            }) {
+                find_scopes_by_path(package.scopes(), &type_path[1..], &mut matches);
+            }
+            return if matches.len() == 1 {
+                scope_member_completions(matches[0])
+            } else {
+                Vec::new()
+            };
+        }
+
+        let mut lexical_scopes: Vec<&dyn Scope> = vec![self];
+        append_containing_scopes(&self.scopes, byte_idx, url, &mut lexical_scopes);
+
+        // Explicit declarations shadow imported names. Search from the innermost
+        // lexical scope out through the compilation-unit scope.
+        for (index, lexical_scope) in lexical_scopes.iter().enumerate().rev() {
+            let matches: Vec<&dyn Scope> = lexical_scope
+                .scopes()
+                .iter()
+                .map(|scope| scope.as_ref())
+                .filter(|scope| is_struct_typedef_scope(*scope))
+                .filter(|scope| scope.ident() == *type_ident)
+                .filter(|scope| index != 0 || &scope.url() == url)
+                .collect();
+            match matches.len() {
+                0 => (),
+                1 => return scope_member_completions(matches[0]),
+                _ => return Vec::new(),
+            }
+        }
+
+        for (index, lexical_scope) in lexical_scopes.iter().enumerate().rev() {
+            let mut matches = Vec::new();
+            for import in lexical_scope.defs() {
+                if index == 0 && &import.url() != url {
+                    continue;
+                }
+                for package in self.scopes.iter().filter(|scope| {
+                    scope.symbol_kind() == SymbolKind::PACKAGE && scope.ident() == import.ident()
+                }) {
+                    for imported_scope in package.scopes() {
+                        let imported_ident = imported_scope.ident();
+                        if is_struct_typedef_scope(imported_scope.as_ref())
+                            && imported_ident == *type_ident
+                            && import.imports_identifier(&imported_ident)
+                        {
+                            push_unique_scope(&mut matches, imported_scope.as_ref());
+                        }
+                    }
+                }
+            }
+            match matches.len() {
+                0 => (),
+                1 => return scope_member_completions(matches[0]),
+                _ => return Vec::new(),
+            }
+        }
+
+        Vec::new()
     }
 
     #[cfg(test)]
@@ -824,18 +1050,8 @@ impl Definition for GenericScope {
             ..CompletionItem::default()
         }
     }
-    fn dot_completion(&self, scope_tree: &GenericScope) -> Vec<CompletionItem> {
-        for scope in scope_tree.scopes() {
-            if scope.ident() == self.ident {
-                return scope
-                    .defs()
-                    .iter()
-                    .filter(|x| !x.starts_with(&scope.ident()))
-                    .map(|x| x.completion())
-                    .collect();
-            }
-        }
-        Vec::new()
+    fn dot_completion(&self, _: &GenericScope) -> Vec<CompletionItem> {
+        scope_member_completions(self)
     }
 }
 

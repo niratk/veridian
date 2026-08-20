@@ -185,6 +185,72 @@ mod tests {
     use crate::support::test_init;
     use ropey::Rope;
 
+    fn open_completion_document(uri: &Url, text: &str) -> LSPServer {
+        let server = LSPServer::new(None);
+        server.did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "systemverilog".to_owned(),
+                version: 0,
+                text: text.to_owned(),
+            },
+        });
+        let fid = server.srcs.get_id(uri);
+        server.srcs.wait_parse_ready(fid, true);
+        server
+    }
+
+    fn dot_completion_items(
+        server: &LSPServer,
+        uri: &Url,
+        text: &str,
+        source_prefix: &str,
+    ) -> Vec<CompletionItem> {
+        let line = text
+            .lines()
+            .position(|line| line.starts_with(source_prefix))
+            .unwrap();
+        let response = server
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position {
+                        line: line as u32,
+                        character: source_prefix.encode_utf16().count() as u32,
+                    },
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: Some(CompletionContext {
+                    trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                    trigger_character: Some(".".to_string()),
+                }),
+            })
+            .unwrap();
+        match response {
+            CompletionResponse::List(list) => list.items,
+            CompletionResponse::Array(items) => items,
+        }
+    }
+
+    fn assert_variable_dot_completion(
+        server: &LSPServer,
+        uri: &Url,
+        text: &str,
+        source_prefix: &str,
+        expected_labels: &[&str],
+    ) {
+        let actual: Vec<_> = dot_completion_items(server, uri, text, source_prefix)
+            .into_iter()
+            .map(|item| (item.label, item.kind))
+            .collect();
+        let expected: Vec<_> = expected_labels
+            .iter()
+            .map(|label| ((*label).to_string(), Some(CompletionItemKind::VARIABLE)))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_get_completion_token() {
         test_init();
@@ -548,6 +614,138 @@ endmodule
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn test_typedef_struct_dot_completion() {
+        test_init();
+        let uri = Url::parse("file:///typedef_struct_completion.sv").unwrap();
+        let text = r#"typedef struct packed {
+    logic [3:0] global_field_a;
+    bit global_field_b;
+} global_t;
+
+typedef struct packed {
+    logic shadowed_global_field;
+} local_t;
+
+module test(input global_t port_value [0:1]);
+    typedef struct packed {
+        logic [7:0] local_field_a;
+        bit local_field_b;
+    } local_t;
+    typedef struct {
+        logic unpacked_field;
+    } unpacked_t;
+    typedef struct packed {
+        logic outer_field;
+        struct packed {
+            logic nested_field;
+        } nested_field;
+    } nested_t;
+    local_t local_value [0:1];
+    unpacked_t unpacked_value;
+    nested_t nested_value;
+    local_t request_data;
+    logic request;
+    initial begin
+        local_value[0].local_field_a;
+        unpacked_value.unpacked_field;
+        nested_value.outer_field;
+        port_value[0].global_field_a;
+        request.unknown_member;
+    end
+endmodule
+"#;
+        let server = open_completion_document(&uri, text);
+
+        assert_variable_dot_completion(
+            &server,
+            &uri,
+            text,
+            "        local_value[0].",
+            &["local_field_a", "local_field_b"],
+        );
+        assert_variable_dot_completion(
+            &server,
+            &uri,
+            text,
+            "        unpacked_value.",
+            &["unpacked_field"],
+        );
+        assert_variable_dot_completion(
+            &server,
+            &uri,
+            text,
+            "        nested_value.",
+            &["outer_field", "nested_field"],
+        );
+        assert_variable_dot_completion(
+            &server,
+            &uri,
+            text,
+            "        port_value[0].",
+            &["global_field_a", "global_field_b"],
+        );
+        assert_variable_dot_completion(&server, &uri, text, "        request.", &[]);
+    }
+
+    #[test]
+    fn test_package_typedef_struct_dot_completion() {
+        test_init();
+        let uri = Url::parse("file:///package_typedef_struct_completion.sv").unwrap();
+        let text = r#"package first_pkg;
+    typedef struct packed {
+        logic first_member;
+    } shared_t;
+endpackage
+
+package second_pkg;
+    typedef struct packed {
+        logic second_member;
+    } shared_t;
+endpackage
+
+package selective_pkg;
+    typedef struct packed {
+        logic selective_member;
+    } selective_t;
+endpackage
+
+module package_test(input first_pkg::shared_t qualified_port);
+    import second_pkg::*;
+    import selective_pkg::selective_t;
+    shared_t imported_value;
+    first_pkg::shared_t qualified_value;
+    selective_t selective_value;
+    initial begin
+        imported_value.second_member;
+        qualified_value.first_member;
+        qualified_port.first_member;
+        selective_value.selective_member;
+    end
+endmodule
+
+module ambiguous_test;
+    import first_pkg::*;
+    import second_pkg::*;
+    shared_t ambiguous_value;
+    initial begin
+        ambiguous_value.unknown_member;
+    end
+endmodule
+"#;
+        let server = open_completion_document(&uri, text);
+
+        for (source_line, member) in [
+            ("        imported_value.", "second_member"),
+            ("        qualified_value.", "first_member"),
+            ("        qualified_port.", "first_member"),
+            ("        selective_value.", "selective_member"),
+        ] {
+            assert_variable_dot_completion(&server, &uri, text, source_line, &[member]);
+        }
+        assert_variable_dot_completion(&server, &uri, text, "        ambiguous_value.", &[]);
     }
 
     #[test]
